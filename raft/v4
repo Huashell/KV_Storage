@@ -1,3 +1,4 @@
+//更改requestvote
 package raft
 
 //
@@ -123,61 +124,66 @@ type RequestVoteReply struct {
 	VoteGranted bool
 }
 
+// example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+	// Your code here (2A, 2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	reply.Term = rf.currentTerm
-	rf.votedFor = -1
+	rf.persist()
+	DPrintf("node {%d} receive a reqvote from node {%d}", rf.me, args.CandidateId)
 	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm // 有更新的当前任期号
 		reply.VoteGranted = false
-	} else if (args.Term > rf.currentTerm || args.Term == rf.currentTerm) && rf.isLogMatch(args.LastLogIndex, args.LastLogTerm) {
-		//原为args.Term > rf.currentTerm || args.Term == rf.currentTerm && rf.isLogMatch(args.LastLogIndex, args.LastLogTerm)
-		//一直无法通过TestBackup2B
+		return
+	}
+
+	if args.Term > rf.currentTerm {
 		if rf.state != FOLLOWER {
 			rf.changeState(FOLLOWER)
 		}
-		rf.currentTerm = args.Term
-		rf.resetElectionTimeout()
-		rf.votedFor = args.CandidateId
+		rf.currentTerm, rf.votedFor = args.Term, -1
 		rf.persist()
-		reply.VoteGranted = true
+	}
+
+	// 2A
+	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
+		if rf.isLogMatch(args.LastLogIndex, args.LastLogTerm) {
+			rf.changeState(FOLLOWER)       // 当前节点状态变成follower
+			rf.votedFor = args.CandidateId // 给候选者投票
+			rf.persist()
+			reply.VoteGranted = true
+			DPrintf("node {%d} vote for node {%d}", rf.me, args.CandidateId)
+		} else {
+			reply.VoteGranted = false
+		}
+
 	} else {
 		reply.VoteGranted = false
 	}
 
+	reply.Term = rf.currentTerm
 }
 
+
+
+// 候选者向其他节点请求投票
 func (rf *Raft) requestVotes() {
-	rf.votedFor = rf.me
+	totalVotes := len(rf.peers)
+
 	rf.currentTerm += 1
-	acquireVotes := 1
+	rf.votedFor = rf.me
+	numVotes := 1
+	rf.persist()
+
 	args := &RequestVoteArgs{
 		Term:         rf.currentTerm,
 		CandidateId:  rf.me,
 		LastLogIndex: rf.getLastLog().Index,
 		LastLogTerm:  rf.getLastLog().Term,
 	}
-	//使用循环调用rpc可能受网络影响导致一直阻塞，使用协程可以达到异步的目的
-	// for peer :=  range rf.peers {
-	// 	rf.mu.Lock()
-	// 	if peer != rf.me {
-	// 		reply := &RequestVoteReply{}
-	// 		rf.peers[peer].Call("Raft.RequestVote", args, reply)
-	// 		if reply.VoteGranted {
-	// 			acquireVotes++
-	// 			if acquireVotes >= len(rf.peers) / 2{
-	// 				rf.changeState(LEADER)
-	// 				rf.leaderId = rf.me
-	// 			}
-	// 		} else if reply.Term > rf.currentTerm{
-	// 		}
-	// 	}
-	// 	rf.mu.Unlock()
-	// }
-	hostnum := len(rf.peers)
-	rf.persist()
-	for peer := range rf.peers {
-		if peer != rf.me {
+
+	for i := range rf.peers {
+		if rf.me != i {
 			go func(peer int) {
 				reply := &RequestVoteReply{}
 				if rf.peers[peer].Call("Raft.RequestVote", args, reply) {
@@ -186,35 +192,41 @@ func (rf *Raft) requestVotes() {
 
 					if rf.state == CANDIDATE && rf.currentTerm == args.Term {
 						if reply.VoteGranted {
-							acquireVotes++
-							if acquireVotes > hostnum/2 {
+							numVotes += 1
+							DPrintf("Candidate{%d} get %d votes", rf.me, numVotes)
+							if numVotes > totalVotes/2 {
 								rf.changeState(LEADER)
 								rf.sendEntries()
 							}
 						}
+
+						// 已经出现了任期更大的节点 本节点强制转换为FOLLOWER
 						if reply.Term > rf.currentTerm {
 							rf.currentTerm = reply.Term
 							rf.votedFor = -1
+							// 要强制转换成跟随者
 							rf.changeState(FOLLOWER)
 						}
 					}
+
 				}
-			}(peer)
+			}(i)
 		}
 	}
+
 }
 
-// AppendEntriesArgs
+// AppendEntriesArgs 附加日志和心跳包的RPC请求参数
 type AppendEntriesArgs struct {
-	Term         int
-	LeaderId     int
-	PreLogIndex  int
-	PreLogTerm   int
-	Logs         []Entry
-	LeaderCommit int
+	Term         int     // 领导⼈的任期号
+	LeaderId     int     // 领导⼈的Id，以便于跟随者重定向请求
+	PreLogIndex  int     // 新的日志条目紧随之前的索引值
+	PreLogTerm   int     // prevLogIndex 条目的任期号
+	Logs         []Entry // 准备存储的日志条目
+	LeaderCommit int     // 领导⼈已经提交的日志的索引值
 }
 
-// AppendEntriesReply
+// AppendEntriesReply 附加日志和心跳包的RPC回复参数
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
@@ -225,33 +237,38 @@ type AppendEntriesReply struct {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	rf.persist()
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.Success = false
 		return
 	}
-	if rf.state != FOLLOWER {
-		rf.changeState(FOLLOWER)
-	}
-	rf.currentTerm = args.Term
-	rf.persist()
 
+	rf.changeState(FOLLOWER)
+	rf.currentTerm = args.Term
+
+	// 2B
 	if len(args.Logs) == 0 {
-		//心跳
 		rf.resetElectionTimeout()
 	}
+	// 延迟的RPC请求 直接丢弃
+	if args.PreLogIndex < rf.getFirstLog().Index {
+		reply.Success, reply.Term = false, 0
+		return
+	}
 
+	// 如果上一条日志索引对应的日志 在本节点的日志队列中不存在 或者无法对应上 那么返回false 表示日志队列不匹配
 	if args.PreLogIndex > rf.getLastLog().Index || rf.logs[args.PreLogIndex-rf.getFirstLog().Index].Term != args.PreLogTerm {
+
 		reply.Success, reply.Term = false, rf.currentTerm
 		lastIndex := rf.getLastLog().Index
 		firstIndex := rf.getFirstLog().Index
 		if args.PreLogIndex > lastIndex {
-			//PreLogIndex超越了当前主机的最新
 			reply.XIndex, reply.XTerm = lastIndex+1, -1
 		} else {
-			//PreLogIndex对应的log的term在leader和当前主机中不相同
 			reply.XTerm = rf.logs[args.PreLogIndex-firstIndex].Term
-			index := args.PreLogIndex
+
+			index := args.PreLogIndex - 1
 			for index >= firstIndex && rf.logs[index-firstIndex].Term == reply.XTerm {
 				index--
 			}
@@ -259,14 +276,18 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 		return
 	}
-	ind := rf.cropLogs(args)
-	//DPrintf("follower %d accept log from index=%d to %d", rf.me)
-	rf.logs = append(rf.logs, args.Logs[ind:]...)
+
+	firstIndex := rf.cropLogs(args)
+	// 附加日志
+	rf.logs = append(rf.logs, args.Logs[firstIndex:]...)
+	// 求出新的commitIndex
 	newCommitIndex := min(args.LeaderCommit, rf.getLastLog().Index)
+	// 通知有新日志提交 如果是重传了已经加入日志队列的数据 那么commitIndex是不会变的 因此加入一个判断
 	if newCommitIndex > rf.commitIndex {
 		rf.commitIndex = newCommitIndex
 		rf.applyMsgCond.Signal()
 	}
+
 	reply.Success, reply.Term = true, rf.currentTerm
 }
 
@@ -296,7 +317,6 @@ func (rf *Raft) sendEntries() {
 					rf.mu.Unlock()
 
 					reply := &AppendEntriesReply{}
-					DPrintf("leader %d send logs to %d", rf.me, peer)
 					if rf.peers[peer].Call("Raft.AppendEntries", args, reply) {
 						rf.mu.Lock()
 						rf.handleAppendEntriesResponse(peer, args, reply)

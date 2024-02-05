@@ -1,3 +1,4 @@
+//通过b和c
 package raft
 
 //
@@ -145,6 +146,49 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = false
 	}
 
+}
+
+func (rf *Raft) RequestVote2(args *RequestVoteArgs, reply *RequestVoteReply) {
+	// Your code here (2A, 2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.persist()
+	DPrintf("node {%d} receive a reqvote from node {%d}", rf.me, args.CandidateId)
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm // 有更新的当前任期号
+		reply.VoteGranted = false
+		return
+	}
+
+	if args.Term > rf.currentTerm {
+		if rf.state != FOLLOWER {
+			rf.changeState(FOLLOWER)
+		}
+		rf.currentTerm, rf.votedFor = args.Term, -1
+		//rf.changeState(FOLLOWER)       // 当前节点状态变成follower
+		rf.votedFor = args.CandidateId // 给候选者投票
+		rf.persist()
+		reply.VoteGranted = true
+		//rf.persist()
+	}
+
+	// 2A
+	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
+		if rf.isLogMatch(args.LastLogIndex, args.LastLogTerm) {
+			rf.changeState(FOLLOWER)       // 当前节点状态变成follower
+			rf.votedFor = args.CandidateId // 给候选者投票
+			rf.persist()
+			reply.VoteGranted = true
+			DPrintf("node {%d} vote for node {%d}", rf.me, args.CandidateId)
+		} else {
+			reply.VoteGranted = false
+		}
+
+	} else {
+		reply.VoteGranted = false
+	}
+
+	reply.Term = rf.currentTerm
 }
 
 func (rf *Raft) requestVotes() {
